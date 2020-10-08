@@ -100,112 +100,58 @@ func ReadRemoteWithResolver(repo repository.ClockedRepo, identityResolver identi
 
 // read will read and parse a Bug from git
 func read(repo repository.ClockedRepo, identityResolver identity.Resolver, ref string) (*Bug, error) {
-	refSplit := strings.Split(ref, "/")
-	id := entity.Id(refSplit[len(refSplit)-1])
+	id := refToId(ref)
 
 	if err := id.Validate(); err != nil {
 		return nil, errors.Wrap(err, "invalid ref ")
 	}
 
 	hashes, err := repo.ListCommits(ref)
-
-	// TODO: this is not perfect, it might be a command invoke error
 	if err != nil {
 		return nil, ErrBugNotExist
 	}
-
-	bug := Bug{
-		id:       id,
-		editTime: 0,
+	if len(hashes) == 0 {
+		return nil, fmt.Errorf("empty bug")
 	}
+
+	bug := Bug{}
 
 	// Load each OperationPack
 	for _, hash := range hashes {
-		entries, err := repo.ReadTree(hash)
-		if err != nil {
-			return nil, errors.Wrap(err, "can't list git tree entries")
-		}
-
 		bug.lastCommit = hash
 
-		var opsEntry repository.TreeEntry
-		opsFound := false
-		var rootEntry repository.TreeEntry
-		rootFound := false
-		var createTime uint64
-		var editTime uint64
-
-		for _, entry := range entries {
-			if entry.Name == opsEntryName {
-				opsEntry = entry
-				opsFound = true
-				continue
-			}
-			if entry.Name == rootEntryName {
-				rootEntry = entry
-				rootFound = true
-			}
-			if strings.HasPrefix(entry.Name, createClockEntryPrefix) {
-				n, err := fmt.Sscanf(entry.Name, createClockEntryPattern, &createTime)
-				if err != nil {
-					return nil, errors.Wrap(err, "can't read create lamport time")
-				}
-				if n != 1 {
-					return nil, fmt.Errorf("could not parse create time lamport value")
-				}
-			}
-			if strings.HasPrefix(entry.Name, editClockEntryPrefix) {
-				n, err := fmt.Sscanf(entry.Name, editClockEntryPattern, &editTime)
-				if err != nil {
-					return nil, errors.Wrap(err, "can't read edit lamport time")
-				}
-				if n != 1 {
-					return nil, fmt.Errorf("could not parse edit time lamport value")
-				}
-			}
-		}
-
-		if !opsFound {
-			return nil, errors.New("invalid tree, missing the ops entry")
-		}
-		if !rootFound {
-			return nil, errors.New("invalid tree, missing the root entry")
+		tree, err := readTree(repo, hash)
+		if err != nil {
+			return nil, err
 		}
 
 		if bug.rootPack == "" {
-			bug.rootPack = rootEntry.Hash
-			bug.createTime = lamport.Time(createTime)
+			bug.rootPack = tree.rootEntry.Hash
+			bug.createTime = tree.createTime
 		}
 
 		// Due to rebase, edit Lamport time are not necessarily ordered
-		if editTime > uint64(bug.editTime) {
-			bug.editTime = lamport.Time(editTime)
+		if tree.editTime > bug.editTime {
+			bug.editTime = tree.editTime
 		}
 
 		// Update the clocks
-		createClock, err := repo.GetOrCreateClock(creationClockName)
+		err = repo.Witness(creationClockName, bug.createTime)
 		if err != nil {
-			return nil, err
-		}
-		if err := createClock.Witness(bug.createTime); err != nil {
 			return nil, errors.Wrap(err, "failed to update create lamport clock")
 		}
-		editClock, err := repo.GetOrCreateClock(editClockName)
+		err = repo.Witness(editClockName, bug.editTime)
 		if err != nil {
-			return nil, err
-		}
-		if err := editClock.Witness(bug.editTime); err != nil {
 			return nil, errors.Wrap(err, "failed to update edit lamport clock")
 		}
 
-		data, err := repo.ReadData(opsEntry.Hash)
+		data, err := repo.ReadData(tree.opsEntry.Hash)
 		if err != nil {
 			return nil, errors.Wrap(err, "failed to read git blob data")
 		}
 
 		opp := &OperationPack{}
 		err = json.Unmarshal(data, &opp)
-
 		if err != nil {
 			return nil, errors.Wrap(err, "failed to decode OperationPack json")
 		}
@@ -214,6 +160,12 @@ func read(repo repository.ClockedRepo, identityResolver identity.Resolver, ref s
 		opp.commitHash = hash
 
 		bug.packs = append(bug.packs, *opp)
+	}
+
+	// Bug Id is the Id of the first operation
+	bug.id = bug.packs[0].Operations[0].Id()
+	if bug.id != id {
+		return nil, fmt.Errorf("create id and ref id don't match")
 	}
 
 	// Make sure that the identities are properly loaded
@@ -425,6 +377,19 @@ func (bug *Bug) Commit(repo repository.ClockedRepo) error {
 		return errors.Wrap(err, "can't commit a bug with invalid data")
 	}
 
+	// update clocks
+	var err error
+	bug.editTime, err = repo.Increment(editClockName)
+	if err != nil {
+		return err
+	}
+	if bug.lastCommit == "" {
+		bug.createTime, err = repo.Increment(creationClockName)
+		if err != nil {
+			return err
+		}
+	}
+
 	// Write the Ops as a Git blob containing the serialized array
 	hash, err := bug.staging.Write(repo)
 	if err != nil {
@@ -443,6 +408,29 @@ func (bug *Bug) Commit(repo repository.ClockedRepo) error {
 		{ObjectType: repository.Blob, Hash: bug.rootPack, Name: rootEntryName},
 	}
 
+	// Store the logical clocks as well
+	// --> edit clock for each OperationPack/commits
+	// --> create clock only for the first OperationPack/commits
+	//
+	// To avoid having one blob for each clock value, clocks are serialized
+	// directly into the entry name
+	emptyBlobHash, err := repo.StoreData([]byte{})
+	if err != nil {
+		return err
+	}
+	tree = append(tree, repository.TreeEntry{
+		ObjectType: repository.Blob,
+		Hash:       emptyBlobHash,
+		Name:       fmt.Sprintf(editClockEntryPattern, bug.editTime),
+	})
+	if bug.lastCommit == "" {
+		tree = append(tree, repository.TreeEntry{
+			ObjectType: repository.Blob,
+			Hash:       emptyBlobHash,
+			Name:       fmt.Sprintf(createClockEntryPattern, bug.createTime),
+		})
+	}
+
 	// Reference, if any, all the files required by the ops
 	// Git will check that they actually exist in the storage and will make sure
 	// to push/pull them as needed.
@@ -459,48 +447,6 @@ func (bug *Bug) Commit(repo repository.ClockedRepo) error {
 		})
 	}
 
-	// Store the logical clocks as well
-	// --> edit clock for each OperationPack/commits
-	// --> create clock only for the first OperationPack/commits
-	//
-	// To avoid having one blob for each clock value, clocks are serialized
-	// directly into the entry name
-	emptyBlobHash, err := repo.StoreData([]byte{})
-	if err != nil {
-		return err
-	}
-
-	editClock, err := repo.GetOrCreateClock(editClockName)
-	if err != nil {
-		return err
-	}
-	bug.editTime, err = editClock.Increment()
-	if err != nil {
-		return err
-	}
-
-	tree = append(tree, repository.TreeEntry{
-		ObjectType: repository.Blob,
-		Hash:       emptyBlobHash,
-		Name:       fmt.Sprintf(editClockEntryPattern, bug.editTime),
-	})
-	if bug.lastCommit == "" {
-		createClock, err := repo.GetOrCreateClock(creationClockName)
-		if err != nil {
-			return err
-		}
-		bug.createTime, err = createClock.Increment()
-		if err != nil {
-			return err
-		}
-
-		tree = append(tree, repository.TreeEntry{
-			ObjectType: repository.Blob,
-			Hash:       emptyBlobHash,
-			Name:       fmt.Sprintf(createClockEntryPattern, bug.createTime),
-		})
-	}
-
 	// Store the tree
 	hash, err = repo.StoreTree(tree)
 	if err != nil {
@@ -513,33 +459,25 @@ func (bug *Bug) Commit(repo repository.ClockedRepo) error {
 	} else {
 		hash, err = repo.StoreCommit(hash)
 	}
-
 	if err != nil {
 		return err
 	}
 
 	bug.lastCommit = hash
+	bug.staging.commitHash = hash
+	bug.packs = append(bug.packs, bug.staging)
+	bug.staging = OperationPack{}
 
-	// if it was the first commit, use the commit hash as bug id
+	// if it was the first commit, use the Id of the first op (create)
 	if bug.id == "" {
-		bug.id = entity.Id(hash)
+		bug.id = bug.packs[0].Operations[0].Id()
 	}
 
 	// Create or update the Git reference for this bug
 	// When pushing later, the remote will ensure that this ref update
 	// is fast-forward, that is no data has been overwritten
 	ref := fmt.Sprintf("%s%s", bugsRefPattern, bug.id)
-	err = repo.UpdateRef(ref, hash)
-
-	if err != nil {
-		return err
-	}
-
-	bug.staging.commitHash = hash
-	bug.packs = append(bug.packs, bug.staging)
-	bug.staging = OperationPack{}
-
-	return nil
+	return repo.UpdateRef(ref, hash)
 }
 
 func (bug *Bug) CommitAsNeeded(repo repository.ClockedRepo) error {
@@ -551,30 +489,6 @@ func (bug *Bug) CommitAsNeeded(repo repository.ClockedRepo) error {
 
 func (bug *Bug) NeedCommit() bool {
 	return !bug.staging.IsEmpty()
-}
-
-func makeMediaTree(pack OperationPack) []repository.TreeEntry {
-	var tree []repository.TreeEntry
-	counter := 0
-	added := make(map[repository.Hash]interface{})
-
-	for _, ops := range pack.Operations {
-		for _, file := range ops.GetFiles() {
-			if _, has := added[file]; !has {
-				tree = append(tree, repository.TreeEntry{
-					ObjectType: repository.Blob,
-					Hash:       file,
-					// The name is not important here, we only need to
-					// reference the blob.
-					Name: fmt.Sprintf("file%d", counter),
-				})
-				counter++
-				added[file] = struct{}{}
-			}
-		}
-	}
-
-	return tree
 }
 
 // Merge a different version of the same bug by rebasing operations of this bug
@@ -675,7 +589,7 @@ func (bug *Bug) Id() entity.Id {
 	if bug.id == "" {
 		// simply panic as it would be a coding error
 		// (using an id of a bug not stored yet)
-		panic("no id yet")
+		panic("no id")
 	}
 	return bug.id
 }

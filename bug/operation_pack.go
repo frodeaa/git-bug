@@ -11,7 +11,8 @@ import (
 
 // 1: original format
 // 2: no more legacy identities
-const formatVersion = 2
+// 3: Ids are generated from the create operation serialized data instead of from the first git commit
+const formatVersion = 3
 
 // OperationPack represent an ordered set of operation to apply
 // to a Bug. These operations are stored in a single Git commit.

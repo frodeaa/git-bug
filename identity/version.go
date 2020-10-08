@@ -131,11 +131,9 @@ func (v *Version) Validate() error {
 	if text.Empty(v.name) && text.Empty(v.login) {
 		return fmt.Errorf("either name or login should be set")
 	}
-
 	if strings.Contains(v.name, "\n") {
 		return fmt.Errorf("name should be a single line")
 	}
-
 	if !text.Safe(v.name) {
 		return fmt.Errorf("name is not fully printable")
 	}
@@ -143,7 +141,6 @@ func (v *Version) Validate() error {
 	if strings.Contains(v.login, "\n") {
 		return fmt.Errorf("login should be a single line")
 	}
-
 	if !text.Safe(v.login) {
 		return fmt.Errorf("login is not fully printable")
 	}
@@ -151,7 +148,6 @@ func (v *Version) Validate() error {
 	if strings.Contains(v.email, "\n") {
 		return fmt.Errorf("email should be a single line")
 	}
-
 	if !text.Safe(v.email) {
 		return fmt.Errorf("email is not fully printable")
 	}
